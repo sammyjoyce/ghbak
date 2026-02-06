@@ -1,0 +1,19 @@
+[Unit]
+Description=ghbak - Daily GitHub org backup (mirrors + optional LFS/wiki)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Optional per-user env file.
+# Example: ~/.config/ghbak/env
+EnvironmentFile=-%h/.config/ghbak/env
+
+# If installed via `nix profile install`, this is typically correct on NixOS.
+# Otherwise, change to the absolute path of `ghbak`.
+ExecStart=%h/.nix-profile/bin/ghbak run
+
+# Lower priority so it stays polite on desktops.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

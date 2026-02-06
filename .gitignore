@@ -1,0 +1,13 @@
+# Nix
+result
+result-*
+
+# direnv
+.direnv/
+
+# Local env/config
+.env
+.envrc
+
+# Backup output (if someone runs from the repo directory)
+Backups/

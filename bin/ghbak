@@ -1,0 +1,359 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+umask 077
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ghbak run [options]
+
+Options (env var in parentheses):
+  --org ORG                 GitHub organization (ORG) (required)
+  --backup-root DIR         Backup root dir (BACKUP_ROOT)
+                            Default: $HOME/Backups/github/$ORG
+  --protocol PROTO          one of: ssh|https (GIT_PROTOCOL)
+                            Default: ssh
+  --include-wiki            Also back up wikis (INCLUDE_WIKI=1)
+  --no-include-wiki         Do not back up wikis (default)
+  --lfs-mode MODE           one of: always|auto|never (LFS_MODE)
+                            Default: always
+  --snapshot-mode MODE      one of: none|restic (SNAPSHOT_MODE)
+                            Default: none
+
+Restic env vars (only if snapshot-mode=restic):
+  RESTIC_REPOSITORY         Restic repository (default: $HOME/Backups/restic/github-$ORG)
+  RESTIC_PASSWORD_FILE      Password file (default: $HOME/.config/restic/github-$ORG.pass)
+  RESTIC_PASSWORD           Password (alternative to password file)
+  RESTIC_KEEP_DAILY         Default 30
+  RESTIC_KEEP_WEEKLY        Default 12
+  RESTIC_KEEP_MONTHLY       Default 12
+
+Notes:
+- Repo discovery uses GitHub CLI: `gh repo list`.
+- Git transport defaults to SSH. Set `GIT_PROTOCOL=https` to use HTTPS cloning instead.
+- LFS objects are stored separately under: $BACKUP_ROOT/lfs/<repo>/
+
+Examples:
+  ORG=example-org ghbak run
+  ghbak run --org example-org --snapshot-mode restic
+EOF
+}
+
+need_cmd() {
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "level=error msg=\"missing dependency\" cmd=$cmd" >&2
+    return 127
+  }
+}
+
+log() {
+  # key=value structured-ish logs (systemd friendly)
+  local level="$1"; shift
+  printf 'level=%s ts=%s %s\n' "$level" "$(date -Is)" "$*"
+}
+
+run_backup() {
+  local org="${ORG:-}"
+  local backup_root="${BACKUP_ROOT:-}"
+  local include_wiki="${INCLUDE_WIKI:-0}"
+  local git_protocol="${GIT_PROTOCOL:-ssh}"
+  local lfs_mode="${LFS_MODE:-always}"
+  local snapshot_mode="${SNAPSHOT_MODE:-none}"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --org)
+        org="${2:-}"; shift 2 ;;
+      --backup-root)
+        backup_root="${2:-}"; shift 2 ;;
+      --protocol)
+        git_protocol="${2:-}"; shift 2 ;;
+      --include-wiki)
+        include_wiki=1; shift ;;
+      --no-include-wiki)
+        include_wiki=0; shift ;;
+      --lfs-mode)
+        lfs_mode="${2:-}"; shift 2 ;;
+      --snapshot-mode)
+        snapshot_mode="${2:-}"; shift 2 ;;
+      -h|--help|help)
+        usage; exit 0 ;;
+      *)
+        echo "Unknown arg: $1" >&2
+        usage
+        exit 2
+        ;;
+    esac
+  done
+
+  if [[ -z "$org" ]]; then
+    echo "Missing --org (or ORG env var)" >&2
+    usage
+    exit 2
+  fi
+
+  if [[ -z "$backup_root" ]]; then
+    backup_root="$HOME/Backups/github/$org"
+  fi
+
+  case "$git_protocol" in
+    ssh|https) ;;
+    *)
+      echo "Invalid --protocol: $git_protocol" >&2
+      exit 2
+      ;;
+  esac
+
+  case "$lfs_mode" in
+    auto|always|never) ;;
+    *)
+      echo "Invalid --lfs-mode: $lfs_mode" >&2
+      exit 2
+      ;;
+  esac
+
+  case "$snapshot_mode" in
+    none|restic) ;;
+    *)
+      echo "Invalid --snapshot-mode: $snapshot_mode" >&2
+      exit 2
+      ;;
+  esac
+
+  need_cmd git
+  need_cmd gh
+  if [[ "$lfs_mode" != "never" ]]; then
+    need_cmd git-lfs
+  fi
+
+  # Prevent git/ssh from prompting in non-interactive contexts.
+  export GIT_TERMINAL_PROMPT=0
+  export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes}"
+
+  mkdir -p "$backup_root"
+
+  # Single-instance lock to avoid overlapping timer runs.
+  need_cmd flock
+  exec 9>"$backup_root/.ghbak.lock"
+  if ! flock -n 9; then
+    log warn msg="already_running" backup_root="$backup_root"
+    exit 0
+  fi
+
+  local mirror_root="$backup_root/mirrors"
+  local lfs_root="$backup_root/lfs"
+  local wiki_root="$backup_root/wikis"
+  local tmp_root="$backup_root/tmp"
+
+  mkdir -p "$mirror_root" "$lfs_root" "$tmp_root"
+  if [[ "$include_wiki" == "1" ]]; then
+    mkdir -p "$wiki_root"
+  fi
+
+  local state_dir="$backup_root/state"
+  mkdir -p "$state_dir"
+  printf 'ts=%s org=%s backup_root=%s include_wiki=%s git_protocol=%s lfs_mode=%s snapshot_mode=%s\n' \
+    "$(date -Is)" "$org" "$backup_root" "$include_wiki" "$git_protocol" "$lfs_mode" "$snapshot_mode" \
+    > "$state_dir/last_run"
+
+  log info msg="backup_start" org="$org" backup_root="$backup_root" include_wiki="$include_wiki" git_protocol="$git_protocol" lfs_mode="$lfs_mode" snapshot_mode="$snapshot_mode"
+
+  # Output: name<TAB>sshUrl
+  mapfile -t repo_lines < <(gh repo list "$org" --limit 1000 --json name,sshUrl --jq '.[] | "\(.name)\t\(.sshUrl)"')
+
+  log info msg="repo_discovered" count="${#repo_lines[@]}"
+  printf '%s\n' "${repo_lines[@]}" > "$state_dir/repos.tsv"
+
+  local successes=0
+  local failures=0
+
+  local line repo ssh_url git_url mirror_dir
+  for line in "${repo_lines[@]}"; do
+    repo="${line%%$'\t'*}"
+    ssh_url="${line#*$'\t'}"
+
+    if [[ "$git_protocol" == "ssh" ]]; then
+      git_url="$ssh_url"
+    else
+      git_url="https://github.com/$org/$repo.git"
+    fi
+
+    mirror_dir="$mirror_root/$repo.git"
+
+    if [[ ! -d "$mirror_dir" ]]; then
+      log info msg="mirror_clone" repo="$repo" url="$git_url"
+      if ! git clone --mirror "$git_url" "$mirror_dir"; then
+        log error msg="mirror_clone_failed" repo="$repo" url="$git_url"
+        failures=$((failures + 1))
+        rm -rf "$mirror_dir"
+        continue
+      fi
+      # Avoid automatic GC pruning unreachable objects (useful for backup semantics).
+      git -C "$mirror_dir" config gc.auto 0 || true
+      git -C "$mirror_dir" config gc.autoDetach false || true
+      git -C "$mirror_dir" config core.logAllRefUpdates true || true
+    else
+      log info msg="mirror_fetch" repo="$repo"
+      if ! git -C "$mirror_dir" fetch --all; then
+        log error msg="mirror_fetch_failed" repo="$repo"
+        failures=$((failures + 1))
+        continue
+      fi
+    fi
+
+    local repo_failed=0
+
+    if [[ "$lfs_mode" != "never" ]]; then
+      local do_lfs=1
+      if [[ "$lfs_mode" == "auto" ]]; then
+        do_lfs=0
+        # Heuristic: look for filter=lfs in any .gitattributes at HEAD.
+        if git --git-dir="$mirror_dir" grep -I -q "filter=lfs" HEAD -- '**/.gitattributes' 2>/dev/null; then
+          do_lfs=1
+        fi
+      fi
+
+      if [[ "$do_lfs" == "1" ]]; then
+        log info msg="lfs_fetch" repo="$repo"
+        local lfs_store="$lfs_root/$repo"
+        mkdir -p "$lfs_store"
+
+        local wt
+        wt="$(mktemp -d "$tmp_root/${repo}.XXXXXX")"
+
+        # Create a throwaway worktree so git-lfs has a non-bare repo context.
+        if git --git-dir="$mirror_dir" worktree add --detach --no-checkout "$wt" HEAD >/dev/null; then
+          if ! (
+            cd "$wt"
+            git config --local lfs.storage "$lfs_store"
+            GIT_LFS_SKIP_SMUDGE=1 git lfs fetch --all origin
+          ); then
+            log error msg="lfs_fetch_failed" repo="$repo"
+            repo_failed=1
+          fi
+          git --git-dir="$mirror_dir" worktree remove --force "$wt" >/dev/null || true
+        else
+          log error msg="lfs_worktree_add_failed" repo="$repo"
+          repo_failed=1
+        fi
+        rm -rf "$wt"
+      else
+        log info msg="lfs_skip" repo="$repo" reason="auto_no_gitattributes_match"
+      fi
+    fi
+
+    if [[ "$include_wiki" == "1" ]]; then
+      local wiki_url wiki_dir
+      if [[ "$git_protocol" == "ssh" ]]; then
+        wiki_url="${git_url%.git}.wiki.git"
+      else
+        wiki_url="https://github.com/$org/$repo.wiki.git"
+      fi
+      wiki_dir="$wiki_root/$repo.wiki.git"
+
+      if [[ ! -d "$wiki_dir" ]]; then
+        log info msg="wiki_clone" repo="$repo" url="$wiki_url"
+        if ! git clone --mirror "$wiki_url" "$wiki_dir" 2>/dev/null; then
+          log info msg="wiki_skip" repo="$repo" reason="wiki_not_found_or_no_access"
+          rm -rf "$wiki_dir"
+        fi
+      else
+        log info msg="wiki_fetch" repo="$repo"
+        if ! git -C "$wiki_dir" fetch --all 2>/dev/null; then
+          log info msg="wiki_skip" repo="$repo" reason="wiki_fetch_failed"
+        fi
+      fi
+    fi
+
+    if [[ "$repo_failed" == "1" ]]; then
+      failures=$((failures + 1))
+    else
+      successes=$((successes + 1))
+    fi
+  done
+
+  log info msg="repo_summary" successes="$successes" failures="$failures"
+
+  local snapshot_failed=0
+
+  if [[ "$snapshot_mode" == "restic" ]]; then
+    need_cmd restic
+
+    local restic_repo="${RESTIC_REPOSITORY:-$HOME/Backups/restic/github-$org}"
+    local keep_daily="${RESTIC_KEEP_DAILY:-30}"
+    local keep_weekly="${RESTIC_KEEP_WEEKLY:-12}"
+    local keep_monthly="${RESTIC_KEEP_MONTHLY:-12}"
+
+    if [[ ! -f "$restic_repo/config" ]]; then
+      log error msg="restic_repo_not_initialized" repository="$restic_repo"
+      snapshot_failed=1
+    fi
+
+    if [[ "$snapshot_failed" == "0" && -z "${RESTIC_PASSWORD:-}" ]]; then
+      local restic_password_file="${RESTIC_PASSWORD_FILE:-$HOME/.config/restic/github-$org.pass}"
+      if [[ ! -f "$restic_password_file" ]]; then
+        log error msg="restic_password_file_missing" path="$restic_password_file"
+        snapshot_failed=1
+      else
+        export RESTIC_PASSWORD_FILE="$restic_password_file"
+      fi
+    fi
+
+    if [[ "$snapshot_failed" == "0" ]]; then
+      log info msg="restic_backup_start" repository="$restic_repo"
+      if ! restic -r "$restic_repo" backup \
+        --exclude "$tmp_root" \
+        "$backup_root"; then
+        log error msg="restic_backup_failed" repository="$restic_repo"
+        snapshot_failed=1
+      fi
+    fi
+
+    if [[ "$snapshot_failed" == "0" ]]; then
+      log info msg="restic_forget" keep_daily="$keep_daily" keep_weekly="$keep_weekly" keep_monthly="$keep_monthly"
+      if ! restic -r "$restic_repo" forget \
+        --keep-daily "$keep_daily" \
+        --keep-weekly "$keep_weekly" \
+        --keep-monthly "$keep_monthly" \
+        --prune; then
+        log error msg="restic_forget_failed" repository="$restic_repo"
+        snapshot_failed=1
+      fi
+    fi
+  fi
+
+  local repo_count="${#repo_lines[@]}"
+  printf 'ts=%s org=%s backup_root=%s repos=%s successes=%s failures=%s snapshot_failed=%s\n' \
+    "$(date -Is)" "$org" "$backup_root" "$repo_count" "$successes" "$failures" "$snapshot_failed" \
+    > "$state_dir/last_summary"
+
+  if [[ "$failures" == "0" && "$snapshot_failed" == "0" ]]; then
+    cp "$state_dir/last_summary" "$state_dir/last_success"
+  fi
+
+  if [[ "$failures" -gt 0 || "$snapshot_failed" == "1" ]]; then
+    log error msg="backup_incomplete" org="$org" successes="$successes" failures="$failures" snapshot_failed="$snapshot_failed"
+    return 1
+  fi
+
+  log info msg="backup_done" org="$org" backup_root="$backup_root" successes="$successes" failures="$failures" snapshot_failed="$snapshot_failed"
+}
+
+main() {
+  local cmd="${1:-run}"
+  shift || true
+
+  case "$cmd" in
+    run) run_backup "$@" ;;
+    -h|--help|help) usage ;;
+    *)
+      echo "Unknown command: $cmd" >&2
+      usage
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"
